@@ -19,7 +19,7 @@ import traceback
 from waitress.buffers import (
     OverflowableBuffer,
     ReadOnlyFileBasedBuffer,
-    )
+)
 
 from waitress.parser import HTTPRequestParser
 
@@ -28,12 +28,12 @@ from waitress.compat import thread
 from waitress.task import (
     ErrorTask,
     WSGITask,
-    )
+)
 
 from waitress.utilities import (
     logging_dispatcher,
     InternalServerError,
-    )
+)
 
 class HTTPChannel(logging_dispatcher, object):
     """
@@ -42,6 +42,7 @@ class HTTPChannel(logging_dispatcher, object):
 
     Setting self.requests = [] allows more requests to be received.
     """
+
     task_class = WSGITask
     error_task_class = ErrorTask
     parser_class = HTTPRequestParser
@@ -67,17 +68,19 @@ class HTTPChannel(logging_dispatcher, object):
             map=None,
             ):
         self.server = server
-        self.addr = addr
         self.adj = adj
         self.outbufs = [OverflowableBuffer(adj.outbuf_overflow)]
         self.creation_time = self.last_activity = time.time()
 
         # task_lock used to push/pop requests
-        self.task_lock = thread.allocate_lock() 
+        self.task_lock = thread.allocate_lock()
         # outbuf_lock used to access any outbuf
         self.outbuf_lock = thread.allocate_lock()
 
         asyncore.dispatcher.__init__(self, sock, map=map)
+
+        # Don't let asyncore.dispatcher throttle self.addr on us.
+        self.addr = addr
 
     def any_outbuf_has_data(self):
         for outbuf in self.outbufs:
@@ -191,7 +194,7 @@ class HTTPChannel(logging_dispatcher, object):
                     # there's no current task, so we don't need to try to
                     # lock the outbuf to append to it.
                     self.outbufs[-1].append(b'HTTP/1.1 100 Continue\r\n\r\n')
-                    self.sent_expect_continue = True
+                    self.sent_continue = True
                     self._flush_some()
                     request.completed = False
             if request.completed:

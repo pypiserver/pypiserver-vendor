@@ -13,6 +13,8 @@
 ##############################################################################
 
 import asyncore
+import os
+import os.path
 import socket
 import time
 
@@ -20,31 +22,48 @@ from waitress import trigger
 from waitress.adjustments import Adjustments
 from waitress.channel import HTTPChannel
 from waitress.task import ThreadedTaskDispatcher
-from waitress.utilities import logging_dispatcher
+from waitress.utilities import cleanup_unix_socket, logging_dispatcher
 
-class WSGIServer(logging_dispatcher, object):
+def create_server(application,
+                  map=None,
+                  _start=True,      # test shim
+                  _sock=None,       # test shim
+                  _dispatcher=None, # test shim
+                  **kw              # adjustments
+                  ):
     """
     if __name__ == '__main__':
-        server = WSGIServer(app)
+        server = create_server(app)
         server.run()
     """
+    adj = Adjustments(**kw)
+    if adj.unix_socket:
+        cls = UnixWSGIServer
+    else:
+        cls = TcpWSGIServer
+    return cls(application, map, _start, _sock, _dispatcher, adj)
+
+class BaseWSGIServer(logging_dispatcher, object):
 
     channel_class = HTTPChannel
     next_channel_cleanup = 0
     socketmod = socket # test shim
     asyncore = asyncore # test shim
+    family = None
 
     def __init__(self,
                  application,
                  map=None,
-                 _start=True, # test shim
-                 _sock=None,  # test shim
+                 _start=True,      # test shim
+                 _sock=None,       # test shim
                  _dispatcher=None, # test shim
-                 **kw # adjustments
+                 adj=None,         # adjustments
+                 **kw
                  ):
-
+        if adj is None:
+            adj = Adjustments(**kw)
         self.application = application
-        self.adj = Adjustments(**kw)
+        self.adj = adj
         self.trigger = trigger.trigger(map)
         if _dispatcher is None:
             _dispatcher = ThreadedTaskDispatcher()
@@ -52,14 +71,17 @@ class WSGIServer(logging_dispatcher, object):
         self.task_dispatcher = _dispatcher
         self.asyncore.dispatcher.__init__(self, _sock, map=map)
         if _sock is None:
-            self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.create_socket(self.family, socket.SOCK_STREAM)
         self.set_reuse_addr()
-        self.bind((self.adj.host, self.adj.port))
+        self.bind_server_socket()
         self.effective_host, self.effective_port = self.getsockname()
         self.server_name = self.get_server_name(self.adj.host)
         self.active_channels = {}
         if _start:
             self.accept_connections()
+
+    def bind_server_socket(self):
+        raise NotImplementedError # pragma: no cover
 
     def get_server_name(self, ip):
         """Given an IP or hostname, try to determine the server name."""
@@ -80,11 +102,11 @@ class WSGIServer(logging_dispatcher, object):
         return server_name
 
     def getsockname(self):
-        return self.socket.getsockname()
+        raise NotImplementedError # pragma: no cover
 
     def accept_connections(self):
         self.accepting = True
-        self.socket.listen(self.adj.backlog)  # Get around asyncore NT limit
+        self.socket.listen(self.adj.backlog) # Get around asyncore NT limit
 
     def add_task(self, task):
         self.task_dispatcher.add_task(task)
@@ -120,18 +142,27 @@ class WSGIServer(logging_dispatcher, object):
                 self.logger.warning('server accept() threw an exception',
                                     exc_info=True)
             return
-        for (level, optname, value) in self.adj.socket_options:
-            conn.setsockopt(level, optname, value)
+        self.set_socket_options(conn)
+        addr = self.fix_addr(addr)
         self.channel_class(self, conn, addr, self.adj, map=self._map)
 
     def run(self):
         try:
-            self.asyncore.loop(map=self._map)
+            self.asyncore.loop(
+                timeout=self.adj.asyncore_loop_timeout,
+                map=self._map
+            )
         except (SystemExit, KeyboardInterrupt):
             self.task_dispatcher.shutdown()
 
     def pull_trigger(self):
         self.trigger.pull_trigger()
+
+    def set_socket_options(self, conn):
+        pass
+
+    def fix_addr(self, addr):
+        return addr
 
     def maintenance(self, now):
         """
@@ -144,3 +175,39 @@ class WSGIServer(logging_dispatcher, object):
             if (not channel.requests) and channel.last_activity < cutoff:
                 channel.will_close = True
 
+class TcpWSGIServer(BaseWSGIServer):
+
+    family = socket.AF_INET
+
+    def bind_server_socket(self):
+        self.bind((self.adj.host, self.adj.port))
+
+    def getsockname(self):
+        return self.socket.getsockname()
+
+    def set_socket_options(self, conn):
+        for (level, optname, value) in self.adj.socket_options:
+            conn.setsockopt(level, optname, value)
+
+class UnixWSGIServer(BaseWSGIServer):
+
+    @property
+    def family(self):
+        # Windows doesnt support AF_UNIX, so hide in property so we don't fail
+        # at import time on it.
+        return socket.AF_UNIX
+
+    def bind_server_socket(self):
+        cleanup_unix_socket(self.adj.unix_socket)
+        self.bind(self.adj.unix_socket)
+        if os.path.exists(self.adj.unix_socket):
+            os.chmod(self.adj.unix_socket, self.adj.unix_socket_perms)
+
+    def getsockname(self):
+        return ('unix', self.socket.getsockname())
+
+    def fix_addr(self, addr):
+        return ('localhost', None)
+
+# Compatibility alias.
+WSGIServer = TcpWSGIServer
